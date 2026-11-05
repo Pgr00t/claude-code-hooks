@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
 # PostToolUse(Bash) hook: after a `git push` of a feature branch has succeeded, publish the judge's verdict for
-# the pushed head as a GitHub commit status on that sha (context judge-gate/verdict), so a CI job can require it.
+# the pushed head as a GitHub commit status on that sha (context judge-gate/verdict), so a CI job can require it
+# (ci/require-judge-verdict.yaml is one such job).
 #   success  "VERDICT: PASS <utc>"           a `# Judge verdict for <branch> at <sha> (<utc>)` section ending in
 #                                            VERDICT: PASS exists in .claude/judge/<branch>.verdict.md
 #   failure  "no judge verdict for this sha" no such section: the push was not gated (hook timed out across a
 #                                            sleep, hook skipped, pushed from a plain shell)
 # Never blocks: always prints {} and exits 0. What it did or skipped goes to ~/.claude/hooks/logs/judge-status.log.
 #
+# Config, from .claude/harness.json in the repo the push targets (every key optional):
+#   protected_branches   branches that are never gated, so never statused (default main, master, release/*)
+#   status.context       the status context (default judge-gate/verdict; a CI job that requires it must agree)
+#   status.gh_user       a gh account to pin the call to (`gh auth token --user`), for a machine with several
+#                        accounts signed in; default none, so gh's active account posts. JUDGE_STATUS_GH_USER
+#                        in the environment wins over the config.
+#
 # The push recognition below (the command regex, `git -C <path>` and the last `cd <path>` before the push) is a
-# copy of judge-gate.sh's, taken 2026-11-03, not a `source`: the gate runs the suite and the judge at top level,
-# so sourcing it would run them. When the gate's recognition changes, change this copy too.
+# copy of judge-gate.sh's, not a `source`: the gate runs the suite and the judge at top level, so sourcing it
+# would run them. When the gate's recognition changes, change this copy too.
 set -u
 LOG="${JUDGE_STATUS_LOG:-$HOME/.claude/hooks/logs/judge-status.log}"
-GH_USER="${JUDGE_STATUS_GH_USER:-ParasInstill}"
-CONTEXT="judge-gate/verdict"
 mkdir -p "$(dirname "$LOG")" 2>/dev/null
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG" 2>/dev/null; }
 finish() { echo '{}'; exit 0; }
@@ -55,8 +61,28 @@ fi
 ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || { log "skip: not a git repo: $PWD"; finish; }
 cd "$ROOT" || finish
 
+# --- configuration (the same file and defaults as judge-gate.sh) -----------------------------
+CONFIG="$ROOT/.claude/harness.json"
+{ [ -f "$CONFIG" ] && jq -e . "$CONFIG" >/dev/null 2>&1; } || CONFIG=""
+cfg() { # $1 = jq path, $2 = default; scalars only
+  local v=""
+  [ -n "$CONFIG" ] && v=$(jq -r "$1 // empty" "$CONFIG" 2>/dev/null)
+  printf '%s' "${v:-$2}"
+}
+cfg_lines() { # $1 = jq path to an array; one element per line, nothing when absent
+  [ -n "$CONFIG" ] && jq -r "($1 // [])[]" "$CONFIG" 2>/dev/null
+}
+CONTEXT=$(cfg '.status.context' 'judge-gate/verdict')
+GH_USER="${JUDGE_STATUS_GH_USER:-$(cfg '.status.gh_user' '')}"
+
 BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || finish
-case "$BRANCH" in main|master|release/*|HEAD) log "skip: branch $BRANCH is not gated"; finish;; esac
+[ "$BRANCH" = HEAD ] && { log "skip: detached HEAD is not gated"; finish; }
+PROTECTED=$(cfg_lines '.protected_branches')
+[ -n "$PROTECTED" ] || PROTECTED=$'main\nmaster\nrelease/*'
+while IFS= read -r pat; do
+  [ -n "$pat" ] || continue
+  case "$BRANCH" in $pat) log "skip: branch $BRANCH is not gated"; finish;; esac
+done <<< "$PROTECTED"
 SHA=$(git rev-parse HEAD 2>/dev/null) || finish
 
 # The latest section for this exact sha that ends in VERDICT: PASS; its timestamp becomes the description.
@@ -79,9 +105,11 @@ printf '%s' "$URL" | grep -Eq '(^|[@/.])github\.com[:/]' || { log "skip: origin 
 SLUG=$(printf '%s' "$URL" | sed -E 's#^.*github\.com[:/]##; s#\.git$##; s#/+$##')
 case "$SLUG" in */*) ;; *) log "skip: cannot read owner/repo from origin: $URL"; finish;; esac
 
-# Two gh accounts are signed in on this machine and the active one is machine-wide; pin the work account.
-TOKEN=$(gh auth token --user "$GH_USER" 2>/dev/null) || TOKEN=""
-[ -n "$TOKEN" ] && export GH_TOKEN="$TOKEN"
+# With several gh accounts signed in the active one is machine-wide, so a configured account is pinned by token.
+if [ -n "$GH_USER" ]; then
+  TOKEN=$(gh auth token --user "$GH_USER" 2>/dev/null) || TOKEN=""
+  [ -n "$TOKEN" ] && export GH_TOKEN="$TOKEN"
+fi
 if RESP=$(gh api -X POST "repos/$SLUG/statuses/$SHA" -f state="$STATE" -f context="$CONTEXT" -f description="$DESC" 2>&1); then
   log "posted $STATE repos/$SLUG/statuses/$SHA branch=$BRANCH description=\"$DESC\""
 else
