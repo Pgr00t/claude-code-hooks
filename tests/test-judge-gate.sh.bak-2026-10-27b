@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# Tests for ~/.claude/hooks/judge-gate.sh: the command filter, the target-repo rules, the packet and lock
+# checks, the exact-id known-failures comparison, and the judge round trip. Everything runs against
+# throwaway git repos under a temp dir, with fake `poetry` and `claude` binaries first on PATH, so no real
+# suite runs and no real judge is started. Nothing outside the temp dir is touched.
+#
+#   bash ~/.claude/hooks/tests/test-judge-gate.sh            # exit 0 when every case passes
+#   HOOK=/path/to/judge-gate.sh bash .../test-judge-gate.sh  # test another copy of the script
+set -u
+HOOK="${HOOK:-$HOME/.claude/hooks/judge-gate.sh}"
+T=$(mktemp -d "${TMPDIR:-/tmp}/judge-gate-test.XXXXXX")
+trap 'rm -rf "$T"' EXIT
+
+# --- fakes -------------------------------------------------------------------------------------
+FAKEBIN="$T/bin"; mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/poetry" <<'X'
+#!/usr/bin/env bash
+# Stands in for `poetry run pytest ...`: prints the canned pytest output the test chose.
+cat "$FAKE_PYTEST_OUT"
+X
+cat > "$FAKEBIN/claude" <<'X'
+#!/usr/bin/env bash
+# Stands in for the headless judge: records its arguments, then answers per FAKE_CLAUDE_MODE.
+printf '%s\n' "$*" > "$FAKE_CLAUDE_ARGS"
+case "${FAKE_CLAUDE_MODE:-PASS}" in
+  notloggedin) echo "Not logged in · Please run /login"; exit 1;;
+  empty) echo '{"result":""}'; exit 0;;
+  *) jq -cn --arg r "1. CLAUDE.md PASS"$'\n'"VERDICT: ${FAKE_CLAUDE_MODE:-PASS}" '{result:$r}';;
+esac
+X
+chmod +x "$FAKEBIN"/*
+export PATH="$FAKEBIN:$PATH"
+export FAKE_PYTEST_OUT="$T/pytest.out" FAKE_CLAUDE_ARGS="$T/claude.args" FAKE_CLAUDE_MODE=PASS
+green_suite() { printf '..\n2 passed in 0.01s\n' > "$FAKE_PYTEST_OUT"; }
+red_suite() { # $@ = FAILED/ERROR lines as pytest -q prints them
+  { printf '%s\n' "$@"; printf '%d failed, 1 passed in 0.01s\n' "$#"; } > "$FAKE_PYTEST_OUT"
+}
+green_suite
+
+# --- fixture repos -----------------------------------------------------------------------------
+gitq() { git -C "$1" "${@:2}" >/dev/null 2>&1; }
+new_repo() { # $1 = path; python repo on IT-1-thing with a checks commit, a build commit and a packet
+  local R="$1"; mkdir -p "$R"
+  git -C "$R" init -q -b main 2>/dev/null || { gitq "$R" init; gitq "$R" checkout -b main; }
+  gitq "$R" config user.email t@t.t; gitq "$R" config user.name t; gitq "$R" config commit.gpgsign false
+  printf '.claude/\n' >> "$R/.git/info/exclude"
+  mkdir -p "$R/tests" "$R/app" "$R/.claude/judge"
+  printf '[tool.poetry]\nname = "t"\n' > "$R/pyproject.toml"
+  printf 'x = 0\n' > "$R/app/a.py"; printf 'def test_old(): pass\n' > "$R/tests/test_old.py"
+  gitq "$R" add -A; gitq "$R" commit -qm 'main'
+  gitq "$R" checkout -qb IT-1-thing
+  printf 'def test_new(): assert False\n' > "$R/tests/test_new.py"
+  gitq "$R" add -A; gitq "$R" commit -qm 'IT-1: Add checks for thing'
+  printf 'x = 1\n' > "$R/app/a.py"; gitq "$R" add -A; gitq "$R" commit -qm 'IT-1: Build thing'
+  : > "$R/.claude/known-failures.txt"
+  packet "$R"
+}
+checks_sha() { git -C "$1" log --format=%H --grep='Add checks' -1; }
+packet() { # $1 = repo, $2 = HEAD to claim (default: real HEAD), $3 = CHECKS_SHA to claim (default: real)
+  local R="$1" H="${2:-$(git -C "$1" rev-parse HEAD)}" C="${3:-$(checks_sha "$1")}"
+  printf '# Judge packet: IT-1-thing\nCHECKS_SHA: %s\nHEAD: %s\nBASE: x\nROUNDS: 1\n' "$C" "$H" > "$R/.claude/judge/IT-1-thing.md"
+}
+commit_all() { gitq "$1" add -A; gitq "$1" commit -qm "$2"; }
+
+# --- runner and assertions ---------------------------------------------------------------------
+OUT=""; PASS=0; FAIL=0
+run_gate() { # $1 = command text, $2 = cwd
+  OUT=$(jq -cn --arg c "$1" --arg d "$2" '{tool_name:"Bash",tool_input:{command:$c},cwd:$d}' | bash "$HOOK" 2>"$T/stderr")
+}
+ok() { PASS=$((PASS+1)); printf 'ok    %s\n' "$1"; }
+bad() { FAIL=$((FAIL+1)); printf 'FAIL  %s\n      got: %s\n' "$1" "$(printf '%s' "$OUT" | head -c 400)"; }
+expect_allow() { [ "$OUT" = "{}" ] && ok "$1" || bad "$1 (expected {})"; }
+expect_pass() {
+  printf '%s' "$OUT" | jq -e '.systemMessage | test("Judge PASS")' >/dev/null 2>&1 && ok "$1" || bad "$1 (expected Judge PASS)"
+}
+expect_deny() { # $1 = name, $2 = text the reason must contain
+  printf '%s' "$OUT" | jq -e --arg s "$2" '.hookSpecificOutput.permissionDecision == "deny" and (.hookSpecificOutput.permissionDecisionReason | contains($s))' >/dev/null 2>&1 \
+    && ok "$1" || bad "$1 (expected deny containing: $2)"
+}
+
+# ===============================================================================================
+echo "# command filter: only a real git push in command position enters the gate"
+R="$T/filter"; new_repo "$R"; rm "$R/.claude/judge/IT-1-thing.md"   # a real push here is denied (no packet)
+run_gate 'git status' "$R";                       expect_allow 'git status is not a push'
+run_gate 'git pushy' "$R";                        expect_allow 'git pushy is not a push'
+run_gate 'echo "git push"' "$R";                  expect_allow 'git push inside a quoted echo argument is not a push'
+run_gate $'cat <<EOF\n(git push)\nEOF' "$R";      expect_allow 'git push after a bare ( in a heredoc is not a push'
+run_gate 'poetry run pytest -q && echo $?' "$R";  expect_allow 'a command with $ but no push is not a push'
+run_gate 'git push' "$R";                         expect_deny 'bare git push enters the gate' 'no packet'
+run_gate 'git push -u origin IT-1-thing' "$R";    expect_deny 'git push with arguments enters the gate' 'no packet'
+run_gate 'make ci/check && git push' "$R";        expect_deny 'git push after && enters the gate' 'no packet'
+run_gate 'true; git push' "$R";                   expect_deny 'git push after ; enters the gate' 'no packet'
+run_gate 'env GIT_SSH=x git push' "$R";           expect_deny 'env VAR=... git push enters the gate' 'no packet'
+run_gate 'echo $(git push 2>&1)' "$R";            expect_deny 'git push inside $( ) enters the gate' 'no packet'
+run_gate "git -C \"$R\" push" "$T";               expect_deny 'git -C <repo> push from another cwd enters the gate' 'no packet'
+run_gate "git -C $R push -u origin b" "$T";       expect_deny 'git -C <repo> push with arguments enters the gate' 'no packet'
+run_gate "cd $R && git push -u origin b" "$T";    expect_deny 'cd <repo> && git push from another cwd enters the gate' 'no packet'
+run_gate "cd '$R' && git push 2>&1 | tail -3; echo \"push exit: \$?\"" "$T"; expect_deny 'the worktree push form with a pipe and $? enters the gate' 'no packet'
+run_gate 'git push' "$T";                         expect_allow 'git push from a folder that is not a git repo passes through'
+run_gate 'git -C /nonexistent-dir-xyz push' "$R"; expect_deny 'git -C <missing dir> push is refused' 'cannot be entered'
+
+echo "# branches: main and release branches are never gated"
+R="$T/branch"; new_repo "$R"; rm "$R/.claude/judge/IT-1-thing.md"
+gitq "$R" checkout main;             run_gate 'git push' "$R"; expect_allow 'push on main is not gated'
+gitq "$R" checkout -b release/qa;    run_gate 'git push' "$R"; expect_allow 'push on release/* is not gated'
+gitq "$R" checkout IT-1-thing;       run_gate 'git push' "$R"; expect_deny 'push on a feature branch is gated' 'no packet'
+
+echo "# packet"
+R="$T/packet"; new_repo "$R"
+packet "$R" "$(checks_sha "$R")";                       run_gate 'git push' "$R"; expect_deny 'packet HEAD must be the current HEAD' 'packet HEAD'
+packet "$R" "" "0000000000000000000000000000000000000000"; run_gate 'git push' "$R"; expect_deny 'packet CHECKS_SHA must be a commit' 'CHECKS_SHA'
+packet "$R";                                             run_gate 'git push' "$R"; expect_pass 'a correct packet, a clean lock, a green suite and a PASS judge allow the push'
+[ -f "$R/.claude/judge/IT-1-thing.verdict.md" ] && grep -q 'VERDICT: PASS' "$R/.claude/judge/IT-1-thing.verdict.md" && ok 'the verdict is saved beside the packet' || { OUT="$(ls "$R/.claude/judge")"; bad 'the verdict is saved beside the packet'; }
+grep -q -- '--model claude-fable-5-1' "$FAKE_CLAUDE_ARGS" && grep -q -- '--disallowedTools Edit,Write' "$FAKE_CLAUDE_ARGS" && ok 'the judge runs on Fable with Edit and Write disallowed' || { OUT="$(cat "$FAKE_CLAUDE_ARGS")"; bad 'the judge runs on Fable with Edit and Write disallowed'; }
+
+echo "# test-file lock"
+R="$T/lock-dirty"; new_repo "$R"
+printf 'def test_new(): pass\n' > "$R/tests/test_new.py"; run_gate 'git push' "$R"; expect_deny 'an uncommitted test edit is refused' 'uncommitted changes to test files'
+R="$T/lock-title"; new_repo "$R"
+printf 'def test_new(): pass\n' > "$R/tests/test_new.py"; commit_all "$R" 'IT-1: Loosen the check'; packet "$R"
+run_gate 'git push' "$R"; expect_deny 'a test commit after the checks commit without a Correct check title is refused' "not 'Correct check'"
+R="$T/lock-foreign"; new_repo "$R"
+printf 'def test_old(): assert True\n' > "$R/tests/test_old.py"; commit_all "$R" 'IT-1: Correct check test_old fixture'; packet "$R"
+run_gate 'git push' "$R"; expect_deny 'a Correct check touching a test file the checks commit did not is refused' "not this ticket's checks"
+R="$T/lock-own"; new_repo "$R"
+printf 'def test_new(): assert 1 == 1\n' > "$R/tests/test_new.py"; commit_all "$R" 'IT-1: Correct check test_new'; packet "$R"
+run_gate 'git push' "$R"; expect_pass 'a Correct check limited to the checks commit files passes the lock'
+R="$T/lock-app"; new_repo "$R"
+printf 'x = 2\n' > "$R/app/a.py"; commit_all "$R" 'IT-1: Tidy'; packet "$R"
+run_gate 'git push' "$R"; expect_pass 'app commits after the checks commit do not trip the lock'
+
+echo "# suite versus known-failures: whole ids only"
+R="$T/suite"; new_repo "$R"
+rm "$R/.claude/known-failures.txt"; run_gate 'git push' "$R"; expect_deny 'a python repo without known-failures.txt is refused' 'is missing'
+: > "$R/.claude/known-failures.txt"
+red_suite 'FAILED tests/test_x.py::TestA::test_b - AssertionError: boom'
+run_gate 'git push' "$R"; expect_deny 'an unlisted red test is refused and named' 'tests/test_x.py::TestA::test_b'
+printf 'tests/test_x.py::TestA::test_b\n' > "$R/.claude/known-failures.txt"
+run_gate 'git push' "$R"; expect_pass 'a red test listed by its whole id is accepted'
+printf 'tests/test_x.py::TestA\n' > "$R/.claude/known-failures.txt"
+run_gate 'git push' "$R"; expect_deny 'a class name alone does not cover a red test in that class' 'tests/test_x.py::TestA::test_b'
+printf 'tests/test_x.py\n' > "$R/.claude/known-failures.txt"
+run_gate 'git push' "$R"; expect_deny 'a file name alone does not cover a red test in that file' 'tests/test_x.py::TestA::test_b'
+printf 'tests/test_x.py::TestA::test_b_extra\n' > "$R/.claude/known-failures.txt"
+run_gate 'git push' "$R"; expect_deny 'a longer id does not cover a shorter one' 'tests/test_x.py::TestA::test_b'
+printf '# comment\n\n  \ntests/test_x.py::TestA::test_b   \n' > "$R/.claude/known-failures.txt"
+run_gate 'git push' "$R"; expect_pass 'comments, blank lines and trailing spaces in the list are ignored'
+red_suite 'FAILED tests/test_x.py::TestA::test_b - AssertionError: boom' 'FAILED tests/test_y.py::test_c - KeyError: 1'
+printf 'tests/test_x.py::TestA::test_b\n' > "$R/.claude/known-failures.txt"
+run_gate 'git push' "$R"; expect_deny 'with two red tests and one listed, the other is named' 'tests/test_y.py::test_c'
+printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason' | grep -q 'tests/test_x.py::TestA::test_b' && { OUT="(listed id was named)"; bad 'the listed red test is not named as unknown'; } || ok 'the listed red test is not named as unknown'
+red_suite 'ERROR tests/test_c.py - ImportError: cannot import name X'
+printf 'tests/test_c.py\n' > "$R/.claude/known-failures.txt"
+run_gate 'git push' "$R"; expect_pass 'a collection error is listed by its file path'
+red_suite 'FAILED tests/test_d.py::test_e'
+printf 'tests/test_d.py::test_e\n' > "$R/.claude/known-failures.txt"
+run_gate 'git push' "$R"; expect_pass 'a FAILED line without a message still yields the id'
+red_suite 'FAILED tests/test_p.py::test_q[a-b] - assert 1 == 2'
+printf 'tests/test_p.py::test_q[a-b]\n' > "$R/.claude/known-failures.txt"
+run_gate 'git push' "$R"; expect_pass 'a parametrised id with a hyphen inside the brackets is kept whole'
+green_suite; : > "$R/.claude/known-failures.txt"
+R="$T/other"; new_repo "$R"; rm "$R/pyproject.toml" "$R/.claude/known-failures.txt"; commit_all "$R" 'IT-1: Build thing more'; packet "$R"
+run_gate 'git push' "$R"; expect_pass 'a repo that is neither python nor web skips the suite and still reaches the judge'
+
+echo "# judge outcomes"
+R="$T/judge"; new_repo "$R"
+FAKE_CLAUDE_MODE=FAIL;        run_gate 'git push' "$R"; expect_deny 'VERDICT: FAIL refuses the push with the report' 'VERDICT FAIL'
+grep -q 'VERDICT: FAIL' "$R/.claude/judge/IT-1-thing.verdict.md" && ok 'a FAIL verdict is saved too' || { OUT="$(cat "$R/.claude/judge/IT-1-thing.verdict.md" 2>&1)"; bad 'a FAIL verdict is saved too'; }
+FAKE_CLAUDE_MODE=notloggedin; run_gate 'git push' "$R"; expect_deny 'a logged-out CLI is reported, not treated as a verdict' 'not logged in'
+FAKE_CLAUDE_MODE=empty;       run_gate 'git push' "$R"; expect_deny 'an empty judge result is refused' 'did not return a report'
+FAKE_CLAUDE_MODE=PASS;        run_gate "cd $R && git push -u origin IT-1-thing" "$T"; expect_pass 'the target repo is taken from the cd before the push'
+run_gate "git -C $R push -u origin IT-1-thing" "$T"; expect_pass 'the target repo is taken from git -C'
+
+echo
+printf '%d passed, %d failed\n' "$PASS" "$FAIL"
+[ "$FAIL" -eq 0 ]
